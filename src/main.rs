@@ -1,6 +1,6 @@
 //! cowsay —— BORUIX 第三方程序样例（b3p 构建目标）。
 //!
-//! 本程序是 `sdk` 的 b3p（build third-party）子命令的验证载体，同时充当
+//! 本程序是 `tools` 的 b3p（build third-party）子命令的验证载体，同时充当
 //! 第三方开发者的最小可抄模板：它只依赖 `libsys`，导出 `user_main`，
 //! 经真实 `int 0x80` 写标准输出，不带任何私有的内核特权。
 //!
@@ -8,7 +8,7 @@
 //!
 //! 内置程序（init/shell/...）经 `USER_PROGRAMS` 编进 liveCD payload，
 //! 被内核 `include_bytes!` 嵌入镜像。本程序**不进 payload**：它由 b3p
-//! 编译后落到 `sdk/diskfiles/3p/`，随数据盘以 `/3p/cowsay.elf` 存在，
+//! 编译后落到 `tools/diskfiles/3p/`，随数据盘以 `/3p/cowsay.elf` 存在，
 //! 由用户在 shell 里经 `/volumes/BORUIX_DATA/3p/cowsay.elf` 执行。
 //!
 //! 该路径成立的前提是内核 `sys_exec` 的 `_` 分支把 a1 当**纯 VFS 路径**
@@ -44,7 +44,10 @@
 //!
 //! 故本程序**不剥首词**，整条命令行就是要说的话。剥首词会把唯一参数吃掉。
 //!
-//! 本程序据此自行切词：见 [`split_args`]。
+//! 本程序不再自行实现这套解析：读取整条命令行用 libsys::cmdline，切词用
+//! libsys::split_words / libsys::words_into——入口参数契约的用户态单点定义
+//! 在 libsys（内核侧由 loader 的 raw::entry_block 及其 host 单测锚定）。
+//! 样例只消费它，这正是第三方程序该抄的形态。
 //!
 //! ## 用法
 //!
@@ -57,7 +60,7 @@
 #![no_std]
 #![no_main]
 
-use libsys::{STDERR, STDOUT, write};
+use libsys::{MAX_CMDLINE_BYTES, STDERR, STDOUT, cmdline, words_into, write};
 
 /// 程序名。仅用于错误提示与用法文本，不参与任何特权判定。
 const PROG: &str = "cowsay";
@@ -81,8 +84,9 @@ const BUBBLE_WIDTH: usize = 74;
 /// 气泡整行最大列数 = 框线长度。供 [`rule`] 定缓冲尺寸（S15 单点）。
 const BUBBLE_MAX_LINE: usize = BUBBLE_WIDTH + 4;
 
-/// 命令行长度上限（字节）。与内核 `CMD_BUF_BYTES` 同量级，仅作防御。
-const MAX_CMDLINE: usize = 4096;
+// 命令行长度上限不再在本程序定义：真实上限是内核 loader 的 STR_OFF-1 = 511
+// 字节（此前这里写 4096，与内核门限不符，属误导）。上限与读取/切词一并由
+// libsys 单点提供（MAX_CMDLINE_BYTES）。
 
 /// 拆词数上限（含首词）。超出即报错，不静默丢弃。
 const MAX_WORDS: usize = 64;
@@ -127,37 +131,6 @@ fn rule(left: u8, right: u8, width: usize) {
     put(b"\n");
 }
 
-/// 按空格/Tab 切词，返回切出的片段数（写入 `out`）。
-///
-/// 连续空白视为一个分隔符；首尾空白忽略。切出的每个片段是命令行缓冲的
-/// 子切片，故 `out` 的生命周期受 `line` 约束。
-///
-/// 返回 `None` 表示词数超过 `out` 容量——**不静默丢弃**多余的词，
-/// 因为那会让用户以为「我的参数生效了」而实际没有。
-fn split_args<'a>(line: &'a [u8], out: &mut [&'a [u8]]) -> Option<usize> {
-    let mut n = 0usize;
-    let mut i = 0usize;
-    while i < line.len() {
-        // 跳过分隔符（空格与 Tab）。
-        while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
-            i += 1;
-        }
-        if i >= line.len() {
-            break;
-        }
-        let start = i;
-        while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
-            i += 1;
-        }
-        if n >= out.len() {
-            return None;
-        }
-        out[n] = &line[start..i];
-        n += 1;
-    }
-    Some(n)
-}
-
 /// 把词列表按单空格拼进 `buf`，返回有效长度；容量不足返回 `None`。
 ///
 /// **绝不静默截断**：截断的气泡与用户输入不符，属 S09 意义上的伪输出。
@@ -180,31 +153,6 @@ fn join_words(words: &[&[u8]], buf: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// 从入口参数块取出整条命令行，返回其字节切片（去尾 NUL）。
-///
-/// # Safety
-///
-/// `argv` 必须是内核 loader 按 `docs/abi/syscall-abi.md` §4 布局的
-/// 参数块：`argc == 1`、`argv[0]` 指向 NUL 结尾的命令行字符串。
-unsafe fn cmdline<'a>(argc: isize, argv: *const *const u8) -> Option<&'a [u8]> {
-    // 无命令行时 argc 槽为 0（ABI §4：rsp = stack_top-0x10）。
-    if argc <= 0 || argv.is_null() {
-        return None;
-    }
-    let p = unsafe { *argv };
-    if p.is_null() {
-        return None;
-    }
-    let mut l = 0usize;
-    while l < MAX_CMDLINE && unsafe { *p.add(l) } != 0 {
-        l += 1;
-    }
-    if l >= MAX_CMDLINE {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts(p, l) })
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 重要：BORUIX 入口的 argc 恒为 1，argv[0] 是**整条命令行**。
@@ -215,7 +163,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     };
 
     let mut words: [&[u8]; MAX_WORDS] = [b""; MAX_WORDS];
-    let n = match split_args(line, &mut words) {
+    let n = match words_into(line, &mut words) {
         Some(n) => n,
         None => {
             emit(STDERR, b"cowsay: too many arguments\n");
@@ -236,7 +184,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     }
     let text_words = &words[..n];
 
-    let mut text = [0u8; MAX_CMDLINE];
+    let mut text = [0u8; MAX_CMDLINE_BYTES];
     let text_len = match join_words(text_words, &mut text) {
         Some(l) => l,
         None => {
@@ -264,4 +212,3 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     put(COW);
     0
 }
-
